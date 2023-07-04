@@ -62,24 +62,24 @@ def saturation_specific_humidity(temp,press):
   return qs
 
 
-def model(grid, T, F=0, moist = 0, albT = 0, seas = 0, thermo = 0):
+def model(grid, T, F=0, moist = 0, albT = 0, seas = 0, thermo = 0,
+  exp='control'):
 
-  if moist==0:
-    D = 0.6 # diffusivity for heat transport (W m^-2 K^-1)
-  elif moist==1:
-    D = 0.3 # diffusivity for heat transport (W m^-2 K^-1)
-  print(f'diffusivity for heat transport is {D} W m^-2 K^-1')
+  if exp!='control' and (albT+seas)!=2:
+    raise ValueError('Sea ice pertrubation experiment only works with albT=1,'+
+      'seas=1, thermo=1')
+
   S1 = 338 # insolation seasonal dependence (W m^-2)
-  A = 196 # OLR when T = 0 (W m^-2)
-  B = 1.8 # OLR temperature dependence (W m^-2 K^-1)
-  #cw = 9.8 # ocean mixed layer heat capacity (W yr m^-2 K^-1)
-  cw = mixedlayer.heatcapacity(60) # ocean mixed layer heat capacity (W yr m^-2 K^-1)
+  A = 193 # OLR when T = 0 (W m^-2)
+  B = 2.1 # OLR temperature dependence (W m^-2 K^-1)
+  cw = 9.8 # ocean mixed layer heat capacity (W yr m^-2 K^-1)
+  # cw = mixedlayer.heatcapacity(60) # ocean mixed layer heat capacity (W yr m^-2 K^-1)
   S0 = 420 # insolation at equator (W m^-2)
   S2 = 240 # insolation spatial dependence (W m^-2)
   a0 = 0.7 # ice-free co-albedo at equator
   a2 = 0.1 # ice=free co-albedo spatial dependence
   ai = 0.4 # co-albedo where there is sea ice
-  Fb = 0 # heat flux from ocean below (W m^-2)
+  Fb = 4 # heat flux from ocean below (W m^-2)
   k = 2 # sea ice thermal conductivity (W m^-1 K^-1)
   Lf = 9.5 # sea ice latent heat of fusion (W yr m^-3)
   cg = 0.098 #0.01*cw # ghost layer heat capacity(W yr m^-2 K^-1)
@@ -88,6 +88,22 @@ def model(grid, T, F=0, moist = 0, albT = 0, seas = 0, thermo = 0):
   cp = 1004.6 # heat capacity of air at constant pressure (J kg^-1 K^-1)
   RH = 0.8 # relative humidity
   Ps = 1E5 # surface pressure (Pa)
+  if moist==0:
+    D = 0.6 # diffusivity for heat transport (W m^-2 K^-1)
+  elif moist==1:
+    D = 0.3 # diffusivity for heat transport (W m^-2 K^-1)
+  F = 0 # greenhouse forcing W/m2
+  Fng = 0 # stand in for exp!='nudging'
+  Fg = 0 # stand in for exp!='ghostflux'
+  E_target_min = -5.0 # ghostflux is applied where E<0 & E_fin_fut>E_target_min
+  nudge_tau = 2.5/365 # nudging timescale (yr)
+  if exp=='future':
+    F = 3.1 # W/m2
+  elif exp=='darkice':
+    if moist:
+        ai = 0.52
+    elif not(moist):
+        ai = 0.48 # co-albedo where there is sea ice
 
   # Read grid dict
   n = grid['n']; dx = grid['dx']; x = grid['x']; xb = grid['xb']
@@ -116,7 +132,9 @@ def model(grid, T, F=0, moist = 0, albT = 0, seas = 0, thermo = 0):
        np.tile(S1*np.cos(2*np.pi*ty),[n,1]).T*np.tile(x,[nt,1]))
 
   # zero out negative insolation
-  S = np.where(S<0,0,S)
+  # S = np.where(S<0,0,S)
+
+  Fcos = 35+30*np.cos(2*np.pi*ty) # used in ghostflux
 
   # Further definitions
   M = B+cg_tau
@@ -129,6 +147,19 @@ def model(grid, T, F=0, moist = 0, albT = 0, seas = 0, thermo = 0):
   T0fin = np.zeros((n,nt))
   ASRfin = np.zeros((n,nt))
   tfin = np.linspace(0,1,nt)
+  Fg_out = np.zeros([n,nt])
+  Fng_out = np.zeros([n,nt])
+
+  # load target sea ice for sea ice perturbation experiments
+  if moist==0:
+    data_dir='/home/lfraser/ebm_data/dry'
+  elif moist==1:
+    data_dir='/home/lfraser/ebm_data/moist'
+  if exp=='control' or exp=='future':
+    Efin_fut = np.zeros([n,nt])#to avoid trying to load file that doesn't exist
+  else:
+    Efin_fut_file = f"{data_dir}/Efin_future.txt"
+    Efin_fut = np.transpose(np.loadtxt(Efin_fut_file))# E from final year of fut
 
   # Initial conditions
   Tg = T
@@ -146,7 +177,19 @@ def model(grid, T, F=0, moist = 0, albT = 0, seas = 0, thermo = 0):
       else:
         alpha = aw
 
-      C = alpha*S[i,:] + cg_tau*Tg - A + F
+      # sea ice forcing 
+      if exp=='specifiedalbedo':
+        alpha = aw*(Efin_fut[i,:]>0) + ai*(Efin_fut[i,:]<0)
+      elif exp=='nudging':
+        Fng = 1/nudge_tau*(2.0-E)*(E<0)*(Efin_fut[i,:]>0)
+        if years==dur-1:
+          Fng_out[:,i] = Fng
+      elif exp=='ghostflux':
+        Fg = Fcos[i]*(E<0)*(Efin_fut[i,:]>E_target_min)
+        if years==dur-1:
+          Fg_out[:,i] = Fg
+
+      C = alpha*S[i,:] + cg_tau*Tg - A + F + Fng + Fg
 
       # surface temperature
       if thermo == 1:
@@ -165,6 +208,17 @@ def model(grid, T, F=0, moist = 0, albT = 0, seas = 0, thermo = 0):
       # Forward Euler on E
       E = E+dt*(C-M*T+Fb) #WE15, eq.A2
 
+      # update albedo for implicit Euler (makes a difference in specifiedalbedo)
+      if albT==1: 
+        alpha = aw*(E>0) + ai*(E<0) #WE15, eq.4
+      # update specified albedo and perturbation fluxes
+      if exp=='specifiedalbedo':
+        alpha = aw*(Efin_fut[(i+1)%nt,:]>0) + ai*(Efin_fut[(i+1)%nt,:]<0)
+      elif exp=='ghostflux':
+        Fg = Fcos[(i+1)%nt]*(E<0)*(Efin_fut[(i+1)%nt,:]>E_target_min)
+      elif exp=='nudging':
+        Fng = 1/nudge_tau*(2.0-E)*(E<0)*(Efin_fut[(i+1)%nt,:]>0)
+
       # Implicit Euler on Tg
       if moist == 1:
 
@@ -175,7 +229,8 @@ def model(grid, T, F=0, moist = 0, albT = 0, seas = 0, thermo = 0):
         if thermo == 1:
         # FM21, eq. 3
           Tg = np.linalg.solve(kappa-np.diag(dc/(M-kLf/E)*(T0<0)*(E<0)),
-                               Tg + rhs1 + (dt_tau*(E/cw*(E>=0)+(ai*S[i,:]-A+F)/(M-kLf/E)*(T0<0)*(E<0))))
+            Tg + rhs1 + (dt_tau*(E/cw*(E>=0) + (alpha*S[(i+1)%nt,:]-A+F+Fng+Fg)
+            /(M-kLf/E)*(T0<0)*(E<0))))
         else:
           Tg = np.linalg.solve(kappa,
                                Tg + rhs1 + dt_tau*(E/cw) )
@@ -184,15 +239,32 @@ def model(grid, T, F=0, moist = 0, albT = 0, seas = 0, thermo = 0):
         if thermo ==1:
         #WE15, eq. A1
           Tg = np.linalg.solve(kappa-np.diag(dc/(M-kLf/E)*(T0<0)*(E<0)),
-                               Tg + (dt_tau*(E/cw*(E>=0)+(ai*S[i,:]-A+F)/(M-kLf/E)*(T0<0)*(E<0))))
+            Tg + (dt_tau*(E/cw*(E>=0)+(alpha*S[(i+1)%nt,:]-A+F+Fng+Fg)
+            /(M-kLf/E)*(T0<0)*(E<0))))
         else:
           Tg = np.linalg.solve(kappa,
                                Tg + dt_tau*(E/cw) )
+    if years%10==0:
+      print(f'year {years} annual mean global mean T: {np.mean(T):.4f}')
 
   print(f'{np.mean(Tfin, axis=(0,1))} global mean temp')
   print(f'{np.ptp(np.mean(Tfin, axis=1))} equator-pole temp difference')
   print(f'{np.mean(S, axis=(0,1))} global mean annual mean inso')
   print(f'{np.mean(ASRfin, axis=(0,1)) - A - B*np.mean(Tfin, axis=(0,1))} energy balance')
+  # save output
+  print("Saving files:")
+  print(f"{data_dir}/x_{exp}.txt")
+  np.savetxt(f"{data_dir}/x_{exp}.txt",x)
+  print(f"{data_dir}/Tfin_{exp}.txt")
+  np.savetxt(f"{data_dir}/Tfin_{exp}.txt",Tfin)
+  print(f"{data_dir}/Efin_{exp}.txt")
+  np.savetxt(f"{data_dir}/Efin_{exp}.txt",Efin)
+  if exp=='ghostflux':
+      print(f"{data_dir}/Fg.txt")
+      np.savetxt(f"{data_dir}/Fg.txt",Fg_out)
+  elif exp=='nudging':
+      print(f"{data_dir}/Fng.txt")
+      np.savetxt(f"{data_dir}/Fng.txt",Fng_out)
 
   return tfin, Efin, Tfin, T0fin, ASRfin
 
@@ -200,7 +272,7 @@ def model(grid, T, F=0, moist = 0, albT = 0, seas = 0, thermo = 0):
 def main():
 
   # Set up grid and time-stepping
-  n = 120
+  n = 500
   dx = 2./n #grid box width
   x = np.linspace(-1+dx/2,1-dx/2,n) #native grid
   xb = np.linspace(-1+dx,1-dx,n-1) 
@@ -210,9 +282,10 @@ def main():
   grid = {'n': n, 'dx': dx, 'x': x, 'xb': xb, 'nt': nt, 'dur': dur, 'dt': dt} 
 
   # Integrate EBM
-  Ti = 7.5+20*(1-2*x**2) # initial condition 
+  Ti = 7.5+20*(1-2*x**2) # initial condition
   F = 0
-  tfin, Efin, Tfin, T0fin, ASRfin = model(grid, Ti, F, moist = 1, albT = 1, seas = 1, thermo = 1)
+  # exp options are control, future, specifiedalbedo, nudging, ghostflux, darkice
+  tfin, Efin, Tfin, T0fin, ASRfin = model(grid, Ti, F, moist = 0, albT = 1, seas = 1, thermo = 1, exp='control')
 
   print("--- %s seconds ---" % (time.time() - start_time))
 
@@ -236,80 +309,80 @@ def main():
   Lf = 9.5 # sea ice latent heat of fusion (W yr m^-3)
   icethick = -Efin/Lf*(Efin<0)
 
-  # plot enthalpy (Fig 2a)
-  plt.subplot(141)
-  clevsE = np.arange(-300,301,50)
-  plt.contourf(tfin,x_n,Efin,clevsE)
-  plt.colorbar()
-  # plot ice edge on E
-  plt.contour(tfin,x_n,icethick,[0],colors='k')
-  plt.xlabel('t (final year)')
-  plt.ylabel('x')
-  plt.ylim(0,1)
-  plt.title(r'E (J m$^{-2}$)')
+  # # plot enthalpy (Fig 2a)
+  # plt.subplot(141)
+  # clevsE = np.arange(-300,301,50)
+  # plt.contourf(tfin,x_n,Efin,clevsE)
+  # plt.colorbar()
+  # # plot ice edge on E
+  # plt.contour(tfin,x_n,icethick,[0],colors='k')
+  # plt.xlabel('t (final year)')
+  # plt.ylabel('x')
+  # plt.ylim(0,1)
+  # plt.title(r'E (J m$^{-2}$)')
 
-  # plot temperature (Fig 2b)
-  plt.subplot(142)
-  clevsT = np.arange(-30,31,5)
-  plt.contourf(tfin,x_n,Tfin,clevsT)
-  plt.colorbar()
-  # plot T=0 contour (the region between ice edge and T=0 contour is the
-  # region of summer ice surface melt)
-  plt.contour(tfin,x_n,icethick,[0],colors='k')
-  plt.contour(tfin,x_n,T0fin,[0],colors='r')
-  plt.xlabel('t (final year)')
-  plt.ylabel('x')
-  plt.ylim(0,1)
-  plt.title(r'T ($^\circ$C)')
+  # # plot temperature (Fig 2b)
+  # plt.subplot(142)
+  # clevsT = np.arange(-30,31,5)
+  # plt.contourf(tfin,x_n,Tfin,clevsT)
+  # plt.colorbar()
+  # # plot T=0 contour (the region between ice edge and T=0 contour is the
+  # # region of summer ice surface melt)
+  # plt.contour(tfin,x_n,icethick,[0],colors='k')
+  # plt.contour(tfin,x_n,T0fin,[0],colors='r')
+  # plt.xlabel('t (final year)')
+  # plt.ylabel('x')
+  # plt.ylim(0,1)
+  # plt.title(r'T ($^\circ$C)')
    
-  # plot the ice thickness (Fig 2c)
-  plt.subplot(1,4,3)
-  clevsh = np.arange(0.00001,5.5,0.5)
-  plt.contourf(tfin,x_n,icethick,clevsh)
-  plt.colorbar()
-  # plot ice edge on h
-  plt.contour(tfin,x_n,icethick,[0],colors='k')
-  plt.plot([tfin[winter], tfin[winter]],[0,max(x_n)],'k')
-  plt.plot([tfin[summer], tfin[summer]],[0,max(x_n)],'k--')
-  plt.xlabel('t (final year)')
-  plt.ylabel('x')
-  plt.ylim(0,1)
-  plt.title('h (m)')
+  # # plot the ice thickness (Fig 2c)
+  # plt.subplot(1,4,3)
+  # clevsh = np.arange(0.00001,5.5,0.5)
+  # plt.contourf(tfin,x_n,icethick,clevsh)
+  # plt.colorbar()
+  # # plot ice edge on h
+  # plt.contour(tfin,x_n,icethick,[0],colors='k')
+  # plt.plot([tfin[winter], tfin[winter]],[0,max(x_n)],'k')
+  # plt.plot([tfin[summer], tfin[summer]],[0,max(x_n)],'k--')
+  # plt.xlabel('t (final year)')
+  # plt.ylabel('x')
+  # plt.ylim(0,1)
+  # plt.title('h (m)')
    
-  # plot temperature profiles (Fig 2d)
-  plt.subplot(444)
-  Summer, = plt.plot(x_n,Tfin[:,summer],'k--',label='summer')
-  Winter, = plt.plot(x_n,Tfin[:,winter],'k',label='winter')
-  plt.plot([0,1],[0,0],'k')
-  plt.xlabel('x')
-  plt.ylabel(r'T ($^\circ$C)')
-  plt.legend(handles = [Summer,Winter],loc=0, fontsize=8)
+  # # plot temperature profiles (Fig 2d)
+  # plt.subplot(444)
+  # Summer, = plt.plot(x_n,Tfin[:,summer],'k--',label='summer')
+  # Winter, = plt.plot(x_n,Tfin[:,winter],'k',label='winter')
+  # plt.plot([0,1],[0,0],'k')
+  # plt.xlabel('x')
+  # plt.ylabel(r'T ($^\circ$C)')
+  # plt.legend(handles = [Summer,Winter],loc=0, fontsize=8)
    
-  # plot ice thickness profiles (Fig 2e)
-  plt.subplot(448)
-  plt.plot(x_n,icethick[:,summer],'k--')
-  plt.plot(x_n,icethick[:,winter],'k')
-  plt.plot([0,1], [0,0],'k')
-  plt.xlim([0.7,1])
-  plt.xlabel('x')
-  plt.ylabel('h (m)')
+  # # plot ice thickness profiles (Fig 2e)
+  # plt.subplot(448)
+  # plt.plot(x_n,icethick[:,summer],'k--')
+  # plt.plot(x_n,icethick[:,winter],'k')
+  # plt.plot([0,1], [0,0],'k')
+  # plt.xlim([0.7,1])
+  # plt.xlabel('x')
+  # plt.ylabel('h (m)')
 
-  # plot seasonal thickness cycle at pole (Fig 2f)
-  plt.subplot(4,4,12)
-  plt.plot(tfin,icethick[-1,:],'k')
-  plt.xlabel('t (final year)')
-  plt.ylabel(r'h$_p$ (m)')
+  # # plot seasonal thickness cycle at pole (Fig 2f)
+  # plt.subplot(4,4,12)
+  # plt.plot(tfin,icethick[-1,:],'k')
+  # plt.xlabel('t (final year)')
+  # plt.ylabel(r'h$_p$ (m)')
    
-  # plot ice edge seasonal cycle (Fig 2g)
-  plt.subplot(4,4,16)
-  xideg = np.degrees(np.arcsin(xi))
-  plt.plot(tfin,xideg,'k-')
-  plt.ylim([40,90])
-  plt.xlabel('t (final year)')
-  plt.ylabel(r'$\theta_i$ (deg)')
+  # # plot ice edge seasonal cycle (Fig 2g)
+  # plt.subplot(4,4,16)
+  # xideg = np.degrees(np.arcsin(xi))
+  # plt.plot(tfin,xideg,'k-')
+  # plt.ylim([40,90])
+  # plt.xlabel('t (final year)')
+  # plt.ylabel(r'$\theta_i$ (deg)')
 
-  plt.tight_layout() 
-  plt.show()
+  # plt.tight_layout() 
+  # plt.show()
 
 
 if __name__ == '__main__':
